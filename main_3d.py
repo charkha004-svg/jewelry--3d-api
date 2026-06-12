@@ -1,13 +1,14 @@
 """
-2D-to-3D Reconstructor Engine — Fixed Version v3
-Fixes: correct /generate args (image + resolution), handle_file on preprocessed path
+2D-to-3D Reconstructor Engine — v4 with image quality enhancement
+Fixes: better preprocessing, max resolution, image sharpening before TripoSR
 """
-import os, logging, tempfile, shutil, traceback, uuid
+import os, logging, tempfile, shutil, traceback, uuid, io
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from gradio_client import Client, handle_file
 from dotenv import load_dotenv
+from PIL import Image, ImageFilter, ImageEnhance
 
 load_dotenv()
 
@@ -38,15 +39,40 @@ def get_next_token():
     return t
 
 
-def extract_glb_path(result) -> str:
+def enhance_image_for_3d(input_path: str) -> str:
     """
-    /generate returns [obj_filedata, glb_filedata]
-    Each filedata is a dict with a 'path' key, or a plain string path.
-    We want index 1 (GLB).
+    Enhance image quality before sending to TripoSR:
+    - Resize to optimal 512x512 (TripoSR's sweet spot)
+    - Sharpen + boost contrast so details are crisp
+    - Place on pure white background (helps background removal)
+    - Save as high-quality PNG (not JPEG — no compression artifacts)
     """
-    logger.info(f"[engine] Raw result type: {type(result)}, value: {repr(result)[:400]}")
+    img = Image.open(input_path).convert("RGBA")
+    
+    # Resize to 512x512 with padding on white background
+    img.thumbnail((512, 512), Image.LANCZOS)
+    canvas = Image.new("RGBA", (512, 512), (255, 255, 255, 255))
+    offset = ((512 - img.width) // 2, (512 - img.height) // 2)
+    canvas.paste(img, offset, img if img.mode == "RGBA" else None)
+    
+    # Convert to RGB, sharpen and boost contrast
+    rgb = canvas.convert("RGB")
+    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+    rgb = ImageEnhance.Contrast(rgb).enhance(1.3)
+    rgb = ImageEnhance.Sharpness(rgb).enhance(2.0)
+    
+    # Save as PNG (lossless — much better for TripoSR)
+    enhanced_path = input_path.replace(".jpg", "_enhanced.png").replace(".jpeg", "_enhanced.png")
+    if not enhanced_path.endswith(".png"):
+        enhanced_path += "_enhanced.png"
+    rgb.save(enhanced_path, format="PNG")
+    logger.info(f"[engine] Enhanced image saved: {enhanced_path} ({rgb.size})")
+    return enhanced_path
 
-    # Expected: list/tuple of two items, we want index 1 (GLB)
+
+def extract_glb_path(result) -> str:
+    logger.info(f"[engine] Raw result type: {type(result)}, value: {repr(result)[:400]}")
+    # /generate returns (obj_filedata, glb_filedata) — we want index 1
     if isinstance(result, (list, tuple)) and len(result) >= 2:
         candidate = result[1]
     elif isinstance(result, (list, tuple)) and len(result) == 1:
@@ -54,13 +80,10 @@ def extract_glb_path(result) -> str:
     else:
         candidate = result
 
-    # Gradio FileData dict
     if isinstance(candidate, dict):
         for key in ["path", "name", "url"]:
             if candidate.get(key):
                 return candidate[key]
-
-    # Plain string path
     if isinstance(candidate, str) and candidate:
         return candidate
 
@@ -75,8 +98,9 @@ async def health():
 @app.post("/api/v1/convert-2d-to-3d")
 async def convert_2d_to_3d(image: UploadFile = File(...)):
     img_path = None
+    enhanced_path = None
     try:
-        # 1. Save to temp file
+        # 1. Save incoming image
         suffix = os.path.splitext(image.filename or "item.jpg")[1] or ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await image.read()
@@ -84,28 +108,27 @@ async def convert_2d_to_3d(image: UploadFile = File(...)):
             img_path = tmp.name
         logger.info(f"[engine] Image saved: {img_path} ({len(content)} bytes)")
 
-        # 2. Token + fresh client
+        # 2. Enhance image quality before TripoSR
+        enhanced_path = enhance_image_for_3d(img_path)
+
+        # 3. Fresh client
         token = get_next_token()
         logger.info("[engine] Connecting to TripoSR...")
         client = Client("stabilityai/TripoSR", token=token)
 
-        # 3. STEP A — preprocess (background removal)
-        # Args: (image, do_remove_background: bool, foreground_ratio: float)
+        # 4. STEP A — preprocess with background removal
+        # Use foreground_ratio=0.90 for jewelry (fills more of the frame)
         logger.info("[engine] Running /preprocess...")
         preprocessed = client.predict(
-            handle_file(img_path),
+            handle_file(enhanced_path),
             True,   # remove background
-            0.85,   # foreground ratio
+            0.90,   # foreground ratio — higher = jewelry fills more frame
             api_name="/preprocess",
         )
-        logger.info(f"[engine] Preprocessed path: {repr(preprocessed)[:200]}")
+        logger.info(f"[engine] Preprocessed: {repr(preprocessed)[:200]}")
 
-        # 4. STEP B — generate 3D
-        # Args: (processed_image, marching_cubes_resolution: float 32-320)
-        # Returns: [obj_filedata, glb_filedata]
-        logger.info("[engine] Running /generate...")
-
-        # preprocessed is a filepath string — wrap it for the next call
+        # 5. STEP B — generate at MAX resolution (320)
+        logger.info("[engine] Running /generate at max resolution (320)...")
         if isinstance(preprocessed, str):
             processed_input = handle_file(preprocessed)
         elif isinstance(preprocessed, dict) and "path" in preprocessed:
@@ -115,22 +138,21 @@ async def convert_2d_to_3d(image: UploadFile = File(...)):
 
         result = client.predict(
             processed_input,
-            256,    # marching cubes resolution (higher = more detail, slower)
+            320,    # MAX marching cubes resolution for best quality
             api_name="/generate",
         )
 
-        # 5. Extract GLB path
+        # 6. Extract and host GLB
         glb_src = extract_glb_path(result)
         logger.info(f"[engine] GLB source: {glb_src}")
 
         if not os.path.exists(glb_src):
             raise FileNotFoundError(f"GLB not found at: {glb_src}")
 
-        # 6. Copy to public dir
         filename = f"mesh_{uuid.uuid4().hex[:8]}.glb"
         dest_path = os.path.join("static", "models", filename)
         shutil.copy(glb_src, dest_path)
-        logger.info(f"[engine] Mesh hosted at: {dest_path}")
+        logger.info(f"[engine] Mesh hosted: {dest_path}")
 
         base_url = os.getenv("RENDER_EXTERNAL_URL", "https://jewelry-3d-api.onrender.com")
         return {
@@ -145,11 +167,12 @@ async def convert_2d_to_3d(image: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        if img_path and os.path.exists(img_path):
-            try:
-                os.unlink(img_path)
-            except Exception:
-                pass
+        for path in [img_path, enhanced_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
