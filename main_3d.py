@@ -1,8 +1,8 @@
 """
-2D-to-3D Reconstructor Engine — Fixed Version
-Fixes: TypeError from result parsing, stale HF client, better fallback
+2D-to-3D Reconstructor Engine — Fixed Version v3
+Fixes: correct /generate args (image + resolution), handle_file on preprocessed path
 """
-import os, logging, tempfile, shutil, traceback
+import os, logging, tempfile, shutil, traceback, uuid
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -40,40 +40,31 @@ def get_next_token():
 
 def extract_glb_path(result) -> str:
     """
-    TripoSR returns results in multiple formats depending on Space version.
-    This handles all known return shapes safely.
+    /generate returns [obj_filedata, glb_filedata]
+    Each filedata is a dict with a 'path' key, or a plain string path.
+    We want index 1 (GLB).
     """
-    logger.info(f"[engine] Raw result type: {type(result)}, value: {repr(result)[:300]}")
+    logger.info(f"[engine] Raw result type: {type(result)}, value: {repr(result)[:400]}")
 
-    # Case 1: list or tuple — try index 1 first (mesh), then 0
-    if isinstance(result, (list, tuple)):
-        for idx in [1, 0]:
-            if idx < len(result) and result[idx]:
-                candidate = result[idx]
-                # Sometimes it's a dict with a 'name' key (gradio FileData)
-                if isinstance(candidate, dict) and "name" in candidate:
-                    return candidate["name"]
-                if isinstance(candidate, str) and (candidate.endswith(".glb") or candidate.endswith(".obj")):
-                    return candidate
-                # Could be a path in a sub-list
-                if isinstance(candidate, (list, tuple)) and len(candidate) > 0:
-                    sub = candidate[0]
-                    if isinstance(sub, dict) and "name" in sub:
-                        return sub["name"]
-                    if isinstance(sub, str):
-                        return sub
+    # Expected: list/tuple of two items, we want index 1 (GLB)
+    if isinstance(result, (list, tuple)) and len(result) >= 2:
+        candidate = result[1]
+    elif isinstance(result, (list, tuple)) and len(result) == 1:
+        candidate = result[0]
+    else:
+        candidate = result
 
-    # Case 2: dict directly
-    if isinstance(result, dict):
-        for key in ["name", "path", "file", "output"]:
-            if key in result and result[key]:
-                return result[key]
+    # Gradio FileData dict
+    if isinstance(candidate, dict):
+        for key in ["path", "name", "url"]:
+            if candidate.get(key):
+                return candidate[key]
 
-    # Case 3: string path
-    if isinstance(result, str) and result:
-        return result
+    # Plain string path
+    if isinstance(candidate, str) and candidate:
+        return candidate
 
-    raise ValueError(f"Cannot extract GLB path from result: {repr(result)[:200]}")
+    raise ValueError(f"Cannot extract GLB path from result: {repr(result)[:300]}")
 
 
 @app.get("/health")
@@ -83,68 +74,68 @@ async def health():
 
 @app.post("/api/v1/convert-2d-to-3d")
 async def convert_2d_to_3d(image: UploadFile = File(...)):
-    """
-    Accepts a 2D jewelry image, runs TripoSR on HuggingFace,
-    hosts the .glb, and returns a live URL.
-    """
     img_path = None
     try:
-        # 1. Save incoming image to temp file
+        # 1. Save to temp file
         suffix = os.path.splitext(image.filename or "item.jpg")[1] or ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await image.read()
             tmp.write(content)
             img_path = tmp.name
+        logger.info(f"[engine] Image saved: {img_path} ({len(content)} bytes)")
 
-        logger.info(f"[engine] Image saved to {img_path} ({len(content)} bytes)")
-
-        # 2. Get token — rotate to avoid quota hits
+        # 2. Token + fresh client
         token = get_next_token()
-        if not token:
-            logger.warning("[engine] No HF token available, trying without auth")
-
-        # 3. Fresh client per request (avoids stale session / 404 heartbeat issue)
-        logger.info("[engine] Connecting to TripoSR space...")
+        logger.info("[engine] Connecting to TripoSR...")
         client = Client("stabilityai/TripoSR", token=token)
-        # 4. Run prediction
-        logger.info("[engine] Running /preprocess then /generate...")
 
-        # Step A: preprocess (remove background)
+        # 3. STEP A — preprocess (background removal)
+        # Args: (image, do_remove_background: bool, foreground_ratio: float)
+        logger.info("[engine] Running /preprocess...")
         preprocessed = client.predict(
             handle_file(img_path),
-            True,    # do_remove_background
-            0.85,    # foreground_ratio
+            True,   # remove background
+            0.85,   # foreground ratio
             api_name="/preprocess",
         )
-        logger.info(f"[engine] Preprocess result: {repr(preprocessed)[:200]}")
+        logger.info(f"[engine] Preprocessed path: {repr(preprocessed)[:200]}")
 
-        # Step B: generate 3D mesh
+        # 4. STEP B — generate 3D
+        # Args: (processed_image, marching_cubes_resolution: float 32-320)
+        # Returns: [obj_filedata, glb_filedata]
+        logger.info("[engine] Running /generate...")
+
+        # preprocessed is a filepath string — wrap it for the next call
+        if isinstance(preprocessed, str):
+            processed_input = handle_file(preprocessed)
+        elif isinstance(preprocessed, dict) and "path" in preprocessed:
+            processed_input = handle_file(preprocessed["path"])
+        else:
+            processed_input = preprocessed
+
         result = client.predict(
-            preprocessed,
+            processed_input,
+            256,    # marching cubes resolution (higher = more detail, slower)
             api_name="/generate",
         )
 
-        # 5. Safely extract .glb file path
+        # 5. Extract GLB path
         glb_src = extract_glb_path(result)
-        logger.info(f"[engine] GLB source path: {glb_src}")
+        logger.info(f"[engine] GLB source: {glb_src}")
 
         if not os.path.exists(glb_src):
-            raise FileNotFoundError(f"GLB file not found at: {glb_src}")
+            raise FileNotFoundError(f"GLB not found at: {glb_src}")
 
-        # 6. Copy to public hosting dir
-        import uuid
+        # 6. Copy to public dir
         filename = f"mesh_{uuid.uuid4().hex[:8]}.glb"
         dest_path = os.path.join("static", "models", filename)
         shutil.copy(glb_src, dest_path)
-        logger.info(f"[engine] Mesh saved to {dest_path}")
+        logger.info(f"[engine] Mesh hosted at: {dest_path}")
 
-        # Render's base URL from env (set this in Render dashboard)
         base_url = os.getenv("RENDER_EXTERNAL_URL", "https://jewelry-3d-api.onrender.com")
-        model_url = f"{base_url}/static/models/{filename}"
-
         return {
             "success": True,
-            "model_url": model_url,
+            "model_url": f"{base_url}/static/models/{filename}",
             "filename": filename,
         }
 
@@ -154,7 +145,6 @@ async def convert_2d_to_3d(image: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        # Always clean up temp file
         if img_path and os.path.exists(img_path):
             try:
                 os.unlink(img_path)
