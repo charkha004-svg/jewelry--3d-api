@@ -44,12 +44,11 @@ async def convert_2d_to_3d(image: UploadFile = File(...)):
         logger.info("[engine] Dispatching asset to neural mesh constructor...")
         client = Client("stabilityai/TripoSR", token=token)
 
-        # 3. Execute 3D mathematical generation
+        # 3. Execute 3D mathematical generation# 3. Execute 3D mathematical generation
         result = client.predict(
-            image=handle_file(img_path),
-            do_remove_background=True,
-            foreground_ratio=0.85,
-            mc_resolution=256,
+            handle_file(img_path),
+            True,    # do_remove_background
+            0.85,    # foreground_ratio
             api_name="/generate",
         )
 
