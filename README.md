@@ -1,0 +1,1 @@
+# jewelry--3d-api
