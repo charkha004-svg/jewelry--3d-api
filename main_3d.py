@@ -42,7 +42,7 @@ async def convert_2d_to_3d(image: UploadFile = File(...)):
         # 2. Establish neural connection
         token = HF_TOKENS[0] if HF_TOKENS else None
         logger.info("[engine] Dispatching asset to neural mesh constructor...")
-        client = Client("stabilityai/TripoSR", hf_token=token)
+        client = Client("stabilityai/TripoSR", token=token)
 
         # 3. Execute 3D mathematical generation
         result = client.predict(
