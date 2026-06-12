@@ -105,8 +105,7 @@ async def convert_2d_to_3d(image: UploadFile = File(...)):
 
         # 3. Fresh client per request (avoids stale session / 404 heartbeat issue)
         logger.info("[engine] Connecting to TripoSR space...")
-        client = Client("stabilityai/TripoSR", hf_token=token)
-
+        client = Client("stabilityai/TripoSR", token=token)
         # 4. Run prediction
         logger.info("[engine] Running /preprocess then /generate...")
 
