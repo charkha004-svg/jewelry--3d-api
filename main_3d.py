@@ -96,14 +96,14 @@ async def health():
 
 
 @app.post("/api/v1/convert-2d-to-3d")
-async def convert_2d_to_3d(image: UploadFile = File(...)):
+async def convert_2d_to_3d(file: UploadFile = File(...)):
     img_path = None
     enhanced_path = None
     try:
         # 1. Save incoming image
-        suffix = os.path.splitext(image.filename or "item.jpg")[1] or ".jpg"
+        suffix = os.path.splitext(file.filename or "item.jpg")[1] or ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            content = await image.read()
+            content = await file.read()
             tmp.write(content)
             img_path = tmp.name
         logger.info(f"[engine] Image saved: {img_path} ({len(content)} bytes)")
