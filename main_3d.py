@@ -61,6 +61,7 @@ async def convert_2d_to_3d(file: UploadFile = File(...)):
         image_token = upload_resp.json()["data"]["image_token"]
         logger.info(f"[engine] Image token: {image_token}")
 
+        
         # 3. Submit image-to-3D task
         logger.info("[engine] Submitting image-to-3D task...")
         task_resp = requests.post(
@@ -71,10 +72,7 @@ async def convert_2d_to_3d(file: UploadFile = File(...)):
                 "file": {
                     "type": "jpg",
                     "file_token": image_token,
-                },
-                "model_version": "v2.5-20250123",  # latest high-quality model
-                "texture": True,
-                "pbr": True,                        # physically-based rendering
+                }
             },
             timeout=30,
         )
