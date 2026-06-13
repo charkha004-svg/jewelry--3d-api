@@ -1,14 +1,12 @@
 """
-2D-to-3D Reconstructor Engine — v4 with image quality enhancement
-Fixes: better preprocessing, max resolution, image sharpening before TripoSR
+2D-to-3D Reconstructor Engine — Tripo3D API Version
+Professional quality 3D reconstruction for jewelry
 """
-import os, logging, tempfile, shutil, traceback, uuid, io
+import os, logging, tempfile, shutil, traceback, uuid, time, requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from gradio_client import Client, handle_file
 from dotenv import load_dotenv
-from PIL import Image, ImageFilter, ImageEnhance
 
 load_dotenv()
 
@@ -27,138 +25,104 @@ logger = logging.getLogger(__name__)
 os.makedirs("static/models", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-HF_TOKENS = [os.getenv(f"HF_TOKEN_{i}", "").strip() for i in range(1, 5) if os.getenv(f"HF_TOKEN_{i}")]
-_token_idx = 0
-
-def get_next_token():
-    global _token_idx
-    if not HF_TOKENS:
-        return None
-    t = HF_TOKENS[_token_idx % len(HF_TOKENS)]
-    _token_idx += 1
-    return t
-
-
-def enhance_image_for_3d(input_path: str) -> str:
-    """
-    Enhance image quality before sending to TripoSR:
-    - Resize to optimal 512x512 (TripoSR's sweet spot)
-    - Sharpen + boost contrast so details are crisp
-    - Place on pure white background (helps background removal)
-    - Save as high-quality PNG (not JPEG — no compression artifacts)
-    """
-    img = Image.open(input_path).convert("RGBA")
-    
-    # Resize to 512x512 with padding on white background
-    img.thumbnail((512, 512), Image.LANCZOS)
-    canvas = Image.new("RGBA", (512, 512), (255, 255, 255, 255))
-    offset = ((512 - img.width) // 2, (512 - img.height) // 2)
-    canvas.paste(img, offset, img if img.mode == "RGBA" else None)
-    
-    # Convert to RGB, sharpen and boost contrast
-    rgb = canvas.convert("RGB")
-    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
-    rgb = ImageEnhance.Contrast(rgb).enhance(1.3)
-    rgb = ImageEnhance.Sharpness(rgb).enhance(2.0)
-    
-    # Save as PNG (lossless — much better for TripoSR)
-    enhanced_path = input_path.replace(".jpg", "_enhanced.png").replace(".jpeg", "_enhanced.png")
-    if not enhanced_path.endswith(".png"):
-        enhanced_path += "_enhanced.png"
-    rgb.save(enhanced_path, format="PNG")
-    logger.info(f"[engine] Enhanced image saved: {enhanced_path} ({rgb.size})")
-    return enhanced_path
-
-
-def extract_glb_path(result) -> str:
-    logger.info(f"[engine] Raw result type: {type(result)}, value: {repr(result)[:400]}")
-    # /generate returns (obj_filedata, glb_filedata) — we want index 1
-    if isinstance(result, (list, tuple)) and len(result) >= 2:
-        candidate = result[1]
-    elif isinstance(result, (list, tuple)) and len(result) == 1:
-        candidate = result[0]
-    else:
-        candidate = result
-
-    if isinstance(candidate, dict):
-        for key in ["path", "name", "url"]:
-            if candidate.get(key):
-                return candidate[key]
-    if isinstance(candidate, str) and candidate:
-        return candidate
-
-    raise ValueError(f"Cannot extract GLB path from result: {repr(result)[:300]}")
+TRIPO_API_KEY = os.getenv("TRIPO_API_KEY", "")
+TRIPO_BASE    = "https://api.tripo3d.ai/v2/openapi"
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "tokens_loaded": len(HF_TOKENS)}
+    return {"status": "ok", "engine": "tripo3d", "key_set": bool(TRIPO_API_KEY)}
 
 
 @app.post("/api/v1/convert-2d-to-3d")
 async def convert_2d_to_3d(file: UploadFile = File(...)):
-    img_path = None
-    enhanced_path = None
+    tmp_path = None
     try:
         # 1. Save incoming image
         suffix = os.path.splitext(file.filename or "item.jpg")[1] or ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await file.read()
             tmp.write(content)
-            img_path = tmp.name
-        logger.info(f"[engine] Image saved: {img_path} ({len(content)} bytes)")
+            tmp_path = tmp.name
+        logger.info(f"[engine] Image saved: {tmp_path} ({len(content)} bytes)")
 
-        # 2. Enhance image quality before TripoSR
-        enhanced_path = enhance_image_for_3d(img_path)
+        headers = {"Authorization": f"Bearer {TRIPO_API_KEY}"}
 
-        # 3. Fresh client
-        token = get_next_token()
-        logger.info("[engine] Connecting to TripoSR...")
-        client = Client("stabilityai/TripoSR", token=token)
+        # 2. Upload image to Tripo
+        logger.info("[engine] Uploading image to Tripo3D...")
+        with open(tmp_path, "rb") as f:
+            upload_resp = requests.post(
+                f"{TRIPO_BASE}/upload",
+                headers=headers,
+                files={"file": (file.filename or "item.jpg", f, "image/jpeg")},
+                timeout=30,
+            )
+        upload_resp.raise_for_status()
+        image_token = upload_resp.json()["data"]["image_token"]
+        logger.info(f"[engine] Image token: {image_token}")
 
-        # 4. STEP A — preprocess with background removal
-        # Use foreground_ratio=0.90 for jewelry (fills more of the frame)
-        logger.info("[engine] Running /preprocess...")
-        preprocessed = client.predict(
-            handle_file(enhanced_path),
-            True,   # remove background
-            0.90,   # foreground ratio — higher = jewelry fills more frame
-            api_name="/preprocess",
+        # 3. Submit image-to-3D task
+        logger.info("[engine] Submitting image-to-3D task...")
+        task_resp = requests.post(
+            f"{TRIPO_BASE}/task",
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "type": "image_to_model",
+                "file": {
+                    "type": "jpg",
+                    "file_token": image_token,
+                },
+                "model_version": "v2.5-20250123",  # latest high-quality model
+                "texture": True,
+                "pbr": True,                        # physically-based rendering
+            },
+            timeout=30,
         )
-        logger.info(f"[engine] Preprocessed: {repr(preprocessed)[:200]}")
+        task_resp.raise_for_status()
+        task_id = task_resp.json()["data"]["task_id"]
+        logger.info(f"[engine] Task ID: {task_id}")
 
-        # 5. STEP B — generate at MAX resolution (320)
-        logger.info("[engine] Running /generate at max resolution (320)...")
-        if isinstance(preprocessed, str):
-            processed_input = handle_file(preprocessed)
-        elif isinstance(preprocessed, dict) and "path" in preprocessed:
-            processed_input = handle_file(preprocessed["path"])
+        # 4. Poll for completion (max 5 minutes)
+        logger.info("[engine] Polling for task completion...")
+        for attempt in range(60):  # 60 x 5s = 5 minutes
+            time.sleep(5)
+            status_resp = requests.get(
+                f"{TRIPO_BASE}/task/{task_id}",
+                headers=headers,
+                timeout=15,
+            )
+            status_resp.raise_for_status()
+            task_data = status_resp.json()["data"]
+            status    = task_data["status"]
+            progress  = task_data.get("progress", 0)
+            logger.info(f"[engine] Status: {status} | Progress: {progress}%")
+
+            if status == "success":
+                glb_url = task_data["output"]["pbr_model"] or task_data["output"]["model"]
+                logger.info(f"[engine] GLB URL: {glb_url}")
+                break
+            elif status in ("failed", "cancelled", "unknown"):
+                raise RuntimeError(f"Tripo task {status}: {task_data.get('message', '')}")
         else:
-            processed_input = preprocessed
+            raise TimeoutError("Tripo3D task timed out after 5 minutes")
 
-        result = client.predict(
-            processed_input,
-            320,    # MAX marching cubes resolution for best quality
-            api_name="/generate",
-        )
+        # 5. Download the GLB
+        logger.info("[engine] Downloading GLB...")
+        glb_resp = requests.get(glb_url, timeout=60)
+        glb_resp.raise_for_status()
 
-        # 6. Extract and host GLB
-        glb_src = extract_glb_path(result)
-        logger.info(f"[engine] GLB source: {glb_src}")
-
-        if not os.path.exists(glb_src):
-            raise FileNotFoundError(f"GLB not found at: {glb_src}")
-
-        filename = f"mesh_{uuid.uuid4().hex[:8]}.glb"
+        filename  = f"mesh_{uuid.uuid4().hex[:8]}.glb"
         dest_path = os.path.join("static", "models", filename)
-        shutil.copy(glb_src, dest_path)
-        logger.info(f"[engine] Mesh hosted: {dest_path}")
+        with open(dest_path, "wb") as f:
+            f.write(glb_resp.content)
+        logger.info(f"[engine] Mesh saved: {dest_path} ({len(glb_resp.content)} bytes)")
 
         base_url = os.getenv("RENDER_EXTERNAL_URL", "https://jewelry-3d-api.onrender.com")
         return {
-            "success": True,
+            "success":   True,
             "model_url": f"{base_url}/static/models/{filename}",
-            "filename": filename,
+            "filename":  filename,
+            "task_id":   task_id,
         }
 
     except Exception as e:
@@ -167,12 +131,11 @@ async def convert_2d_to_3d(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        for path in [img_path, enhanced_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
