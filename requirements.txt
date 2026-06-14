@@ -3,5 +3,5 @@ uvicorn==0.30.1
 python-multipart==0.0.9
 python-dotenv==1.0.1
 aiofiles==23.2.1
-requests
-Pillow
+requests==2.32.3
+Pillow==10.3.0
